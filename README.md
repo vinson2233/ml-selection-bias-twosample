@@ -63,7 +63,7 @@ Inside the `code` folder, you can find :
 - `results-analysis_4thJune2025.Rmd`: Analysis and visualization of simulation results.
 - `renv.lock`: Package versions for reproducibility
 
-![flow chart](flow_chart_thesis.png)
+![flow chart](Diagram Study Flow.png)
 
 ## Usage
 
@@ -176,3 +176,4 @@ results/logs/[config_name]/rep[XXX]_log.txt
 
 
 <img src="https://www.rug.nl/digital-competence-centre/news/images/cbs-0.jpg" width="425"/> <img src="https://huisstijl.leidenuniv.nl/assets/files/ul-algemeen-internationaal-rgb-color.png" width="425"/> 
+

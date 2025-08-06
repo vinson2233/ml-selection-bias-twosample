@@ -1,0 +1,1418 @@
+---
+title: "Code for analzing Result"
+output: html_notebook
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Library Import
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(latex2exp)
+```
+
+# Data Loading 
+
+```{r}
+load("../simulation_config_full.RData")
+SIMULATION_CONFIGS = SIMULATION_CONFIGS %>% bind_rows(.id="config")
+SIMULATION_CONFIGS$nonprob_size = as.integer(SIMULATION_CONFIGS$nonprob_size)
+
+list_result = list.files(path="../result_5June",pattern="_combined.csv",full.names = T)
+results = lapply(list_result,read.csv) %>% bind_rows() %>% mutate("pct_bias" = 100*(estimate - y_true)/y_true)
+
+list_files_big = list.files(path="../result_9June_big",pattern="_combined.csv",full.names = T)
+results2 = lapply(list_files_big,read.csv)  %>% bind_rows() %>% mutate("pct_bias" = 100*(estimate - y_true)/y_true)
+
+list_datasets = c("synthethic_linear_high_noise","synthethic_linear_low_noise","synthethic_non_linear")
+list_np_sampling = c("simple","complex")
+results2$prob_size = 100000
+results2$nonprob_size = 100000
+results2$dataset = str_extract(results2$config,paste(list_datasets,collapse="|"))
+results2$method_variant = str_extract(results2$config,paste(list_np_sampling,collapse="|"))
+results2$config_name = results2$config
+results2$description = ""
+results2$sampling_technique = "synthetic"
+
+results = results %>% left_join(SIMULATION_CONFIGS,by = "config")
+
+results = rbind(results,results2)
+results = results %>% 
+  mutate(error = estimate-y_true)
+results$np_sampling = results$method_variant
+results$np_sampling = ifelse(results$np_sampling=="complex","Non-Linear","Linear")
+results$dataset = as.factor(results$dataset)
+results$dataset = relevel(results$dataset,"synthethic_linear_low_noise","synthethic_linear_high_noise","synthethic_non_linear","okr")
+
+results$dataset = recode(results$dataset,synthethic_linear_high_noise = "SyntheticLinear_HighNoise",synthethic_linear_low_noise = "SyntheticLinear_LowNoise",synthethic_non_linear = "SyntheticNonLinear")
+
+result_nosubset = results %>% filter((subset!="NP+P-Intersection") %>% replace_na(T))
+```
+
+
+Control result for Naive methods
+```{r}
+df_naive = result_nosubset %>% filter(method=="naive",nonprob_size!=100000)  %>%
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")"))%>% group_by(dataset,np_sampling,pair_size) %>% summarise("%RB" = mean(error/y_true)*100,"RRMSE" = sqrt(mean(error^2))/mean(y_true))
+df_naive
+```
+
+# Research Question 1
+
+## Result 1 : IPW Analysis
+Analyze Chen's IPW performances 
+```{r}
+results$method %>% unique()
+```
+
+```{r,fig.width=12}
+plot_ipw = result_nosubset %>% filter(
+  dataset %in% c(
+    "SyntheticLinear_HighNoise",
+    "SyntheticLinear_LowNoise",
+    "SyntheticNonLinear"
+  ),
+  method %in% c("IPW2"),
+  nonprob_size != 100000
+)  %>% pivot_wider(
+  names_from = ps_model,
+  values_from = error,
+  id_cols = c(
+    dataset,
+    np_sampling,
+    replication,
+    nonprob_size,
+    prob_size,
+    y_true
+  )
+) %>% group_by(dataset, np_sampling, nonprob_size, prob_size) %>% summarise(
+  LogReg = sqrt(mean(ps_logreg_custom^2)) / mean(y_true),
+  XGBoost1 = sqrt(mean(ps_xgb_custom_1^2)) /
+    mean(y_true),
+  XGBoost2 = sqrt(mean(ps_xgb_custom_2^2)) /
+    mean(y_true)
+)  %>%
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>%
+  mutate(pair_size = factor(
+    pair_size,
+    c(
+      "(1000,500)",
+      "(1000,1500)",
+      "(1000,5000)",
+      "(5000,500)",
+      "(5000,1500)",
+      "(5000,5000)",
+      "(25000,500)",
+      "(25000,1500)",
+      "(25000,5000)",
+      "(100000,100000)"
+    )
+  )) %>%
+  pivot_longer(c(LogReg, XGBoost1, XGBoost2),
+               names_to = "PS_model",
+               values_to = "RRMSE") %>% arrange(prob_size, nonprob_size) %>% 
+  ggplot(aes(x = pair_size, y = RRMSE, fill = PS_model)) + 
+  geom_col(position = "dodge") + 
+  geom_errorbar(data = df_naive %>% filter(dataset!="okr"),aes(x=pair_size,ymin=RRMSE,ymax=RRMSE,colour = "Naive est."),linetype="dashed",inherit.aes = F) +
+  scale_colour_manual(name = "", values = c("Naive est." = "black")) +
+
+  facet_grid(np_sampling ~ dataset, labeller = label_wrap_gen(width = 10)) + 
+  guides(x = guide_axis(angle = 45)) + 
+  xlab(TeX("Pair sample size $(n_{NP},n_{P})$")) + 
+  ylab("Relative RMSE") + theme_minimal()
+plot_ipw + geom_line(aes(x=pair_size,y=0))
+```
+
+Tabular view
+
+Focus on XGBoost capture on non-linearity on large dataset
+```{r}
+ipw_produce_aggregated_summarise <- function(filtered_dataset){
+  a =filtered_dataset %>% pivot_wider(names_from = ps_model,values_from = error,id_cols = c(replication,nonprob_size,prob_size)) %>% group_by(nonprob_size,prob_size) %>% summarise(rmse_logreg = sqrt(mean(ps_logreg_custom^2)),rmse_xgb_1 = sqrt(mean(ps_xgb_custom_1^2)),rmse_xgb_2 = sqrt(mean(ps_xgb_custom_2^2)),rmse_naive = sqrt(mean(`-`^2)))
+  
+  b =filtered_dataset %>% pivot_wider(names_from = ps_model,values_from = pct_bias,id_cols = c(replication,nonprob_size,prob_size)) %>% group_by(nonprob_size,prob_size) %>% summarise(pct_rb_logreg = mean(ps_logreg_custom),pct_rb_xgb_1 = mean(ps_xgb_custom_1),pct_rb_xgb_2 = mean(ps_xgb_custom_2),pct_rb_naive = mean(`-`))
+  a %>% left_join(b,by = c("nonprob_size",'prob_size'))
+  
+}
+
+ipw_produce_aggregated_summarise(result_nosubset %>% filter(dataset=="SyntheticNonLinear",np_sampling=="Non-Linear",method %in% c("IPW2","naive")))
+```
+
+Calculate correlation between performance metrics error and the final estimation error
+```{r}
+results %>% 
+  filter(subset=="NP+P-Intersection",method=="IPW2",dataset!="okr") %>% group_by(dataset,np_sampling) %>% 
+  summarise(mxe = cor(mxe,abs(error)),cal1 = cor(cal1,abs(error)))
+```
+
+## Result 2 : REG Analysis
+
+Regression based result evaluation
+```{r}
+df_reg_result = result_nosubset %>% filter(
+  dataset %in% c(
+    "SyntheticLinear_HighNoise",
+    "SyntheticLinear_LowNoise",
+    "SyntheticNonLinear"
+  ),nonprob_size != 100000,
+  method %in% c("REG","naive")
+) %>% pivot_wider(
+  names_from = or_model,
+  values_from = error,
+  id_cols = c(dataset,np_sampling, replication, nonprob_size, prob_size,y_true)
+) %>% group_by(dataset,np_sampling, nonprob_size, prob_size) %>% summarise(DecisionTree = sqrt(mean(or_decision_tree ^2))/mean(y_true),
+                                                               LinearRegression = sqrt(mean(or_lin_reg ^ 2))/mean(y_true),
+                                                               RandomForest = sqrt(mean(or_random_forest ^ 2))/mean(y_true),
+                                                               XGBoost = sqrt(mean(or_xgboost ^ 2))/mean(y_true),
+                                                               `Naive Est.` = sqrt(mean(`-` ^ 2))/mean(y_true)) 
+df_reg_result
+```
+
+```{r,fig.width= 14}
+df_reg_result %>%
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>%
+  mutate(pair_size = factor(
+    pair_size,
+    c(
+      "(1000,500)",
+      "(1000,1500)",
+      "(1000,5000)",
+      "(5000,500)",
+      "(5000,1500)",
+      "(5000,5000)",
+      "(25000,500)",
+      "(25000,1500)",
+      "(25000,5000)",
+      "(100000,100000)"
+    )
+  )) %>%
+  pivot_longer(
+    c(DecisionTree, LinearRegression, RandomForest, XGBoost),
+    names_to = "model",
+    values_to = "rel_rmse"
+  ) %>% arrange(prob_size, nonprob_size) %>%
+  ggplot(aes(x = pair_size, y = rel_rmse, fill = model)) +
+  geom_col(position = "dodge") +
+  facet_wrap(np_sampling ~
+               dataset)  +
+  guides(x = guide_axis(angle = 45)) +
+  xlab(TeX("Pair sample size $(n_{NP},n_{P})$")) +
+  ylab("Relative RMSE") +
+  geom_errorbar(
+    data = df_naive %>% filter(dataset != "okr"),
+    aes(
+      x = pair_size,
+      ymin = RRMSE,
+      ymax = RRMSE,
+      colour = "Naive est."
+    ),
+    linetype = "dashed",
+    inherit.aes = F
+  ) +
+  scale_colour_manual(name = "", values = c("Naive est." = "black")) +
+  theme_minimal()
+```
+Calculate the error
+```{r}
+results %>% filter(method=="REG",dataset!="okr") %>% group_by(dataset,np_sampling) %>% summarise(mae = cor(or_mae,abs(error)),r2 = cor(or_rsq,abs(error))) 
+```
+
+
+## Result 3 Doubly Robust
+Analysis on doubly robust using chen's ipw and regression. 
+Fit multiple mixed model and evaluate the performances
+```{r}
+library(lme4)
+df_dr = result_nosubset %>% select(replication,dataset,np_sampling,nonprob_size,prob_size,ps_model,or_model,method,estimate,y_true) %>% filter(dataset!="okr",nonprob_size!=100000,method=="DR2")
+
+df_dr$abs_pct_error = abs(df_dr$y_true - df_dr$estimate)/df_dr$y_true
+mixed_model1 = lmer(abs_pct_error ~ dataset + or_model + np_sampling + ps_model + nonprob_size + prob_size  + (1 | replication) , data = df_dr,REML = F)
+mixed_model2 = lmer(abs_pct_error ~ dataset*or_model + np_sampling + ps_model + nonprob_size + prob_size  + (1 | replication) , data = df_dr,REML = F)
+mixed_model3 = lmer(abs_pct_error ~ dataset*or_model + np_sampling*ps_model + nonprob_size + prob_size  + (1 | replication) , data = df_dr,REML = F)
+mixed_model4 = lmer(abs_pct_error ~ dataset*or_model*nonprob_size + np_sampling*ps_model*prob_size  + (1 | replication) , data = df_dr,REML = F)
+
+anova(mixed_model1,mixed_model2,mixed_model3,mixed_model4,refit=FALSE)
+```
+
+ANOVA decomposition on each factors
+```{r}
+car::Anova(mixed_model4,type="III")
+```
+```{r}
+df_dr %>% group_by(nonprob_size, dataset, or_model) %>% summarise(mean = mean(abs_pct_error),upper = mean(abs_pct_error) + qt(1 - alpha / 2, (n()-1)) * sd(abs_pct_error,na.rm=T)/sqrt(n()),lower = mean(abs_pct_error) - qt(1 - alpha / 2, (n()-1)) * sd(abs_pct_error,na.rm=T)/sqrt(n()))
+```
+
+Visualization on three way interactions
+```{r,fig.width=8,fig.height=8}
+alpha = 0.05
+df_plot = df_dr %>% 
+  group_by(nonprob_size, dataset, or_model) %>% 
+  summarise(mean = mean(abs_pct_error),
+            lower = mean(abs_pct_error) - qt(1 - alpha / 2, (n()-1)) * sd(abs_pct_error,na.rm=T)/sqrt(n()),
+            upper = mean(abs_pct_error) + qt(1 - alpha / 2, (n()-1)) * sd(abs_pct_error,na.rm=T)/sqrt(n())
+    )
+
+df_scales <- data.frame(
+  Panel = c("SyntheticLinear_LowNoise", "SyntheticLinear_HighNoise", "SyntheticNonLinear"),
+  ymin = c(0, 0, 0),
+  ymax = c(0.04, 0.04, 0.08)
+)
+df_scales <- split(df_scales, df_scales$Panel)
+
+scales <- lapply(df_scales, function(x) {
+  scale_y_continuous(limits = c(x$ymin, x$ymax))
+})
+
+ggplot(df_plot, aes(x = nonprob_size , y = mean , color = or_model)) +
+  geom_line() +
+  geom_point(size=3) +
+  geom_ribbon(aes(ymin = lower,ymax = upper),linetype=2,alpha=0.05) + 
+  #  scale_y_log10(
+  #   breaks = scales::trans_breaks("log10", function(x) 10^x),
+  #   labels = scales::trans_format("log10", scales::math_format(10^.x))
+  # ) +
+  facet_wrap( ~ dataset,scales="free_y") +
+  ggh4x::facetted_pos_scales(y = scales) + 
+  theme_minimal() +
+  ylab("Mean Absolute Percentage Error") + 
+  guides(x = guide_axis(angle = 45)) + 
+  xlab(TeX("NP sample size $(n_{NP})$")) +
+  ggtitle("Dataset") +
+  theme(legend.position = "bottom") +
+  labs(color = TeX("OR model ($m(x))$")) +
+  scale_color_discrete(
+    labels = c(
+      "or_decision_tree" = "DecisionTree",
+      "or_lin_reg" = "LinReg",
+      "or_random_forest" = "RandomForest",
+      "or_xgboost" = "XGBoost"
+    )
+  )
+```
+
+```{r,fig.width=6,fig.height=6}
+df_plot = df_dr %>% group_by(prob_size, np_sampling, ps_model) %>% summarise(
+  mean = mean(abs_pct_error),
+  lower = mean(abs_pct_error) - qt(1 - alpha / 2, (n() - 1)) * sd(abs_pct_error, na.rm =T) / sqrt(n()),
+  upper = mean(abs_pct_error) + qt(1 - alpha / 2, (n() - 1)) * sd(abs_pct_error, na.rm =T) / sqrt(n())
+)
+
+ggplot(df_plot, aes(x = prob_size , y = mean , color = ps_model)) +
+  geom_line() +
+  geom_point() +
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              linetype = 2,
+              alpha = 0.05) +
+  facet_wrap(~ np_sampling) +
+  ylab("Mean Absolute Percentage Error") +
+  labs(color = TeX("PS model( $\\pi^{NP}(x))$")) +
+  scale_color_discrete(
+    labels = c(
+      "ps_logreg_custom" = "LogReg",
+      "ps_xgb_custom_1" = "XGBoost1",
+      "ps_xgb_custom_2" = "XGBoost2"
+    )
+  ) + guides(x = guide_axis(angle = 45)) +
+  xlab(TeX("P sample size $(n_{P})$")) +
+  ggtitle("NP sampling") +  theme_minimal() +
+  theme(legend.position = "bottom")  
+```
+
+# Research Question 2 
+
+Evaluation of Machine Learning Methods on Liu-EV
+
+```{r,fig.width=10}
+result_pw = result_nosubset %>% 
+  filter(method %in% c("pseudo-weighting"),dataset!="okr") %>% 
+  group_by(dataset,np_sampling,nonprob_size,prob_size,ps_model) %>% 
+  summarise(rel_rmse = sqrt(mean(error^2))/mean(y_true)) %>% ungroup()  %>% filter(str_detect(ps_model,"uncal"))
+result_pw
+result_pw %>% 
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)","(100000,100000)"))) %>% arrange(prob_size, nonprob_size) %>% ggplot(aes(x = pair_size, y = rel_rmse, fill = ps_model)) + geom_col(position = "dodge") + facet_grid(np_sampling ~dataset)  + guides(x = guide_axis(angle = 45)) + xlab(TeX("Pair sample size $(n_{NP},n_{P})$")) + ylab("Relative RMSE") + labs(fill = TeX("PS model ($\\pi^{NP}(x))$")) + scale_fill_discrete(
+    labels = c(
+      "uncal_decision_tree" = "DecisionTree",
+      "uncal_logreg" = "LogReg",
+      "uncal_random_forest" = "RandomForest",
+      "uncal_xgboost" = "XGBoost",
+      "uncal_qda_model" = "QDA"
+    )
+  ) + 
+   geom_errorbar(
+    data = df_naive %>% filter(dataset != "okr"),
+    aes(
+      x = pair_size,
+      ymin = RRMSE,
+      ymax = RRMSE,
+      colour = "Naive est."
+    ),
+    linetype = "dashed",
+    inherit.aes = F
+  ) +
+  scale_colour_manual(name = "", values = c("Naive est." = "black")) + theme_minimal() + theme(legend.position="bottom")
+```
+
+```{r}
+results %>% 
+  filter(method=="pseudo-weighting",dataset!="okr",subset=="NP+P-Intersection") %>% 
+  group_by(dataset,np_sampling,nonprob_size,prob_size,ps_model) %>% 
+  summarise(rel_rmse = sqrt(mean(error^2))/mean(y_true),mxe = mean(mxe),brier=mean(brier),cal1=mean(cal1)) %>% 
+  ungroup()  %>% filter(str_detect(ps_model,"uncal"))
+```
+
+```{r}
+library(dplyr)
+results %>% 
+filter(method=="pseudo-weighting",dataset!="okr",subset=="NP+P-Intersection") %>% mutate(abs_pct_error = abs(error)) %>% group_by(dataset,np_sampling) %>% summarise(mxe = cor(mxe,abs(error)),cal1 = cor(cal1,abs(error)))
+```
+
+# Combination of Doubly Robust by replacing the IPW with LEV
+
+
+```{r}
+df_plot = result_nosubset %>% 
+  filter(dataset=="okr", !method %in% c("DR1","IPW1"),!str_detect(ps_model,"iso|platt")) %>%
+  group_by(method,or_model,ps_model,nonprob_size,prob_size) %>% 
+  summarise(rmse = sqrt(mean(error^2))) %>% filter(ps_model %in% c("ps_logreg_custom","uncal_logreg")) %>% arrange(prob_size,nonprob_size,rmse)
+df_plot
+```
+
+```{r}
+result_nosubset %>% 
+  # filter(dataset=="okr") %>% 
+  filter(dataset=="okr", !method %in% c("DR1","IPW1"),!str_detect(ps_model,"iso|platt")) %>%
+  group_by(method,or_model,ps_model,nonprob_size,prob_size) %>% 
+  summarise(rmse = sqrt(mean(error^2))) %>% arrange(nonprob_size,prob_size) %>% 
+  group_by(nonprob_size,prob_size) %>% 
+  slice_max(order_by = rmse,n=5) #%>% write.csv("result_okr.csv")
+```
+```{r}
+result_nosubset %>% 
+  # filter(dataset=="okr") %>% 
+  filter(dataset=="okr", !method %in% c("DR1","IPW1"),str_detect(ps_model,"log"),!str_detect(ps_model,"iso|platt"),method %in% c("pseudo-weighting","IPW2")) %>%
+  group_by(method,or_model,ps_model,nonprob_size,prob_size) %>% 
+  summarise(rmse = sqrt(mean(error^2))) %>% 
+  group_by(nonprob_size,prob_size) %>% 
+  slice_min(order_by = rmse,n=5) 
+```
+
+```{r}
+df_okr = results %>% filter(dataset=="okr", !method %in% c("DR1","IPW1"),method=="pseudo-weighting",subset=="NP+P-Intersection",str_detect(ps_model,"uncal")) %>% select(dataset,np_sampling,replication,prob_size,nonprob_size,ps_model,cal1,error)
+
+best_cal1 = df_okr %>% group_by(replication,prob_size,nonprob_size) %>% slice_min(cal1,n=1) %>% ungroup() %>% select(replication,prob_size,nonprob_size,a = ps_model)
+best_actual = df_okr %>% group_by(replication,prob_size,nonprob_size) %>% slice_min(abs(error),n=1) %>%  ungroup() %>% select(replication,prob_size,nonprob_size,b = ps_model)
+
+temp = best_cal1 %>% left_join(best_actual)
+mean(temp$a == temp$b)
+```
+```{r}
+worse_cal1 = df_okr %>% group_by(replication,prob_size,nonprob_size) %>% slice_max(cal1,n=1) %>% ungroup() %>% select(replication,prob_size,nonprob_size,a = ps_model)
+worse_actual = df_okr %>% group_by(replication,prob_size,nonprob_size) %>% slice_max(abs(error),n=1) %>%  ungroup() %>% select(replication,prob_size,nonprob_size,b = ps_model)
+
+temp = worse_cal1 %>% left_join(worse_actual)
+mean(temp$a == temp$b)
+```
+
+```{r}
+results %>% filter(dataset=="okr", !method %in% c("DR1","IPW1"),method=="REG") %>% group_by(dataset,prob_size,nonprob_size,or_model) %>% summarise(rmse = sqrt(mean(error^2)),r2 = mean(or_rsq))
+```
+
+
+# Check if ML is actually better with the pseudo-weight 
+
+Desperate check
+
+```{r}
+results %>% 
+filter(method=="pseudo-weighting",dataset!="okr",subset=="NP+P-Intersection") %>% mutate(abs_pct_error = abs(error/y_true))%>% dplyr::select(mxe,abs_pct_error) %>% cor()
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+# Reseach Question 3 : Relationship between model performance and estimation accuracy
+```{r}
+list_result1 = list.files(path="../result_5June",pattern="_combined.csv",full.names = T)
+results1 = lapply(list_result1,read.csv) %>% bind_rows() %>% filter(method=="pseudo-weighting")
+
+list_result2 = list.files(path="../result_30June_retry",pattern="_combined.csv",full.names = T)
+results2 = lapply(list_result2,read.csv) %>% bind_rows() %>% filter(method!="pseudo-weighting")
+results2$replication = results2$replication + 150
+
+result3 = bind_rows(results1,results2) %>% left_join(SIMULATION_CONFIGS,by = "config") %>% mutate(abs_pct_error = abs(estimate - y_true)/y_true*100) %>% filter(dataset!="okr") 
+
+result3$np_sampling = ifelse(result3$method_variant=="complex","Non-Linear","Linear")
+result3$dataset = as.factor(result3$dataset)
+result3$dataset = relevel(result3$dataset,"synthethic_linear_low_noise","synthethic_linear_high_noise","synthethic_non_linear")
+
+result3$dataset = recode(result3$dataset,synthethic_linear_high_noise = "SyntheticLinear_HighNoise",synthethic_linear_low_noise = "SyntheticLinear_LowNoise",synthethic_non_linear = "SyntheticNonLinear")
+
+result3 %>% filter(method=="DR2") %>% select(mxe,brier,cal1,or_rsq,or_mae,abs_pct_error) %>% cor(use = "pairwise.complete.obs")
+```
+```{r}
+result3 %>% filter(method=="REG") %>% ggplot(aes(x=or_rsq,col=or_model)) + geom_density() + facet_grid(~dataset) + theme_minimal() + theme(legend.position="bottom") + labs(color = TeX("OR model ($m(x))$")) + scale_color_discrete(
+    labels = c(
+      "or_decision_tree" = "DecisionTree",
+      "or_lin_reg" = "LinReg",
+      "or_random_forest" = "RandomForest",
+      "or_xgboost" = "XGBoost"
+    )
+  ) 
+```
+
+
+```{r}
+result3 %>% filter(method=="IPW2",subset=="NP+P-Intersection") %>% ggplot(aes(x=brier,col=ps_model)) + stat_ecdf() + facet_grid(~np_sampling) +   scale_color_discrete(
+    labels = c(
+      "ps_logreg_custom" = "LogReg",
+      "ps_xgb_custom_1" = "XGBoost1",
+      "ps_xgb_custom_2" = "XGBoost2"
+    )
+  ) + guides(x = guide_axis(angle = 45)) + 
+  xlab(TeX("BrierScore"))  +  theme_minimal() +
+ theme(legend.position = "bottom") 
+```
+```{r}
+result3 %>% filter(method=="IPW2",subset=="NP+P-Intersection") %>% ggplot(aes(x=cal1,col=ps_model)) + stat_ecdf() + facet_grid(np_sampling~dataset) +   scale_color_discrete(
+    labels = c(
+      "ps_logreg_custom" = "LogReg",
+      "ps_xgb_custom_1" = "XGBoost1",
+      "ps_xgb_custom_2" = "XGBoost2"
+    )
+  ) + guides(x = guide_axis(angle = 45)) + 
+  xlab(TeX("BrierScore"))  +  theme_minimal() +
+ theme(legend.position = "bottom") 
+```
+
+```{r,fig.width=12}
+result3 %>% mutate(error = estimate - y_true) %>% filter(method=="REG") %>% ggplot(aes(x=or_rsq,y=error/y_true,col=or_model)) + geom_point(size=0.4) + facet_grid(np_sampling~dataset + prob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + ylim(-0.25,0.25) +xlab("OR model 5-fold Cross-Validation R^2")+ guides(col = guide_legend(override.aes = list(size=2))) + labs(color = TeX("OR model ($m(x))$")) +theme(legend.position="bottom")+ scale_color_discrete(
+    labels = c(
+      "or_decision_tree" = "DecisionTree",
+      "or_lin_reg" = "LinReg",
+      "or_random_forest" = "RandomForest",
+      "or_xgboost" = "XGBoost"
+    )
+  ) + ggtitle("Regression estimate")
+```
+
+```{r,fig.width=12}}
+result3 %>% mutate(error = estimate - y_true)  %>% filter(str_detect(ps_model,"uncal_logreg"))%>% filter(method %in% c("pseudo-weighting"),subset=="NP+P-Intersection") %>% arrange(nonprob_size)%>% ggplot(aes(x=cal1,y=error/y_true,col=factor(prob_size))) + geom_point(size=1,alpha=0.6) + facet_grid(np_sampling~dataset+nonprob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + xlim(0,1) + ylim(-0.3,0.3) + guides(col = guide_legend(override.aes = list(size=2))) + labs(fill = TeX("PS model ($\\pi^{NP}(x))$"),col=TeX("Probability sample size ($n_P$)")) + scale_fill_discrete(
+    labels = c(
+      "uncal_decision_tree" = "DecisionTree",
+      "uncal_logreg" = "LogReg",
+      "uncal_random_forest" = "RandomForest",
+      "uncal_xgboost" = "XGBoost",
+      "uncal_qda_model" = "QDA"
+    )
+  ) + theme_minimal() + theme(legend.position="bottom")
+```
+
+```{r,fig.width=12}}
+result3 %>% mutate(error = estimate - y_true)  %>% filter(str_detect(ps_model,"uncal_xgboost"))%>% filter(method %in% c("pseudo-weighting"),subset=="NP+P-Intersection") %>% arrange(nonprob_size)%>% ggplot(aes(x=cal1,y=error/y_true,col=factor(prob_size))) + geom_point(size=1,alpha=0.6) + facet_grid(np_sampling~dataset+nonprob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + xlim(0,1) + ylim(-0.3,0.3) + guides(col = guide_legend(override.aes = list(size=2))) + labs(fill = TeX("PS model ($\\pi^{NP}(x))$"),col=TeX("Probability sample size ($n_P$)")) + scale_fill_discrete(
+    labels = c(
+      "uncal_decision_tree" = "DecisionTree",
+      "uncal_logreg" = "LogReg",
+      "uncal_random_forest" = "RandomForest",
+      "uncal_xgboost" = "XGBoost",
+      "uncal_qda_model" = "QDA"
+    )
+  ) + theme_minimal() + theme(legend.position="bottom")
+```
+
+```{r,fig.width=14}
+result3 %>% mutate(error = estimate - y_true)  %>% filter(str_detect(ps_model,"uncal_"),!ps_model  %in% c("uncal_random_forest","uncal_decision_tree"))%>% filter(method %in% c("pseudo-weighting"),subset=="NP+P-Intersection") %>% arrange(nonprob_size)%>% ggplot(aes(x=cal1,y=error/y_true,col=factor(prob_size))) + geom_point(size=1,alpha=0.6) + facet_grid(np_sampling~dataset+nonprob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + xlim(0,1) + ylim(-0.3,0.3) + guides(col = guide_legend(override.aes = list(size=2))) + labs(fill = TeX("PS model ($\\pi^{NP}(x))$"),col=TeX("Probability sample size ($n_P$)")) + scale_fill_discrete(
+    labels = c(
+      "uncal_decision_tree" = "DecisionTree",
+      "uncal_logreg" = "LogReg",
+      "uncal_random_forest" = "RandomForest",
+      "uncal_xgboost" = "XGBoost",
+      "uncal_qda_model" = "QDA"
+    )
+  ) + theme_minimal() + theme(legend.position="bottom") + ggtitle("LEV Pseudo-Weighting : Logistic Regression, QDA,and XGBoost ")
+```
+
+```{r,fig.width=14}
+result3 %>% mutate(error = estimate - y_true)  %>% filter(str_detect(ps_model,"uncal_"),ps_model  %in% c("uncal_random_forest","uncal_decision_tree"))%>% filter(method %in% c("pseudo-weighting"),subset=="NP+P-Intersection") %>% arrange(nonprob_size)%>% ggplot(aes(x=cal1,y=error/y_true,col=factor(prob_size))) + geom_point(size=1,alpha=0.6) + facet_grid(np_sampling~dataset+nonprob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + xlim(0,1) + ylim(-0.3,0.3) + guides(col = guide_legend(override.aes = list(size=2))) + labs(fill = TeX("PS model ($\\pi^{NP}(x))$"),col=TeX("Probability sample size ($n_P$)")) + scale_fill_discrete(
+    labels = c(
+      "uncal_decision_tree" = "DecisionTree",
+      "uncal_logreg" = "LogReg",
+      "uncal_random_forest" = "RandomForest",
+      "uncal_xgboost" = "XGBoost",
+      "uncal_qda_model" = "QDA"
+    )
+  ) + theme_minimal() + theme(legend.position="bottom")+ ggtitle("LEV Pseudo-Weighting : Random Forest and Decision Tree")
+```
+
+```{r,fig.width=14}
+result3 %>% mutate(error = estimate - y_true)  %>% filter(method=="IPW2")%>% filter(subset=="NP+P-Intersection") %>% arrange(nonprob_size)%>% ggplot(aes(x=cal1,y=error/y_true,col=factor(prob_size))) + geom_point(size=1,alpha=0.6) + facet_grid(np_sampling~dataset+nonprob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + xlim(0,1) + ylim(-0.3,0.3) + guides(col = guide_legend(override.aes = list(size=2))) + labs(fill = TeX("PS model ($\\pi^{NP}(x))$"),col=TeX("Probability sample size ($n_P$)")) + scale_fill_discrete(
+    labels = c(
+      "uncal_decision_tree" = "DecisionTree",
+      "uncal_logreg" = "LogReg",
+      "uncal_random_forest" = "RandomForest",
+      "uncal_xgboost" = "XGBoost",
+      "uncal_qda_model" = "QDA"
+    )
+  ) + theme_minimal() + theme(legend.position="bottom") + ggtitle("Chen's IPW")
+```
+
+```{r}
+result3 %>% mutate(error = estimate - y_true) %>% filter(method=="IPW2") %>% ggplot(aes(x=brier,y=error/y_true,col=or_model)) + geom_point(size=0.4) + facet_grid(np_sampling~dataset + prob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + ylim(-0.25,0.25) +xlab("OR model 5-fold Cross-Validation R^2")+ guides(col = guide_legend(override.aes = list(size=2))) + labs(color = TeX("OR model ($m(x))$")) +theme(legend.position="bottom")+ scale_color_discrete(
+    labels = c(
+      "or_decision_tree" = "DecisionTree",
+      "or_lin_reg" = "LinReg",
+      "or_random_forest" = "RandomForest",
+      "or_xgboost" = "XGBoost"
+    )
+  ) 
+```
+
+```{r,fig.width=12}
+result3 %>% mutate(error = estimate - y_true)  %>% filter(str_detect(ps_model,"uncal"))%>% filter(method %in% c("pseudo-weighting"),subset=="NP+P-Intersection") %>% ggplot(aes(x=cal1,y=error/y_true,col=ps_model,size=prob_size)) + geom_point() + facet_grid(np_sampling~dataset+nonprob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + xlim(0,1) + ylim(-0.3,0.3) + guides(col = guide_legend(override.aes = list(size=2)))
+```
+```{r}
+result3 %>% mutate(error = estimate - y_true) %>% lm(abs(error) ~ ,data = .)
+```
+
+```{r}
+result3 %>% mutate(error = estimate - y_true)  %>% filter(ps_model=="ps_xgb_custom_1")%>% filter(subset=="NP+P-Intersection") %>% ggplot(aes(x=brier,y=error/y_true,col=factor(prob_size))) + geom_point(size=0.4) + facet_grid(np_sampling~dataset+nonprob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + xlim(0,1) + ylim(-0.3,0.3) + guides(col = guide_legend(override.aes = list(size=2)))
+```
+
+```{r}
+df_temp = result3 %>% mutate(error = estimate - y_true) %>% filter(subset=="NP+P-Intersection")
+
+
+produce_summary_relation <- function(df_main){
+  a = df_main %>% filter(ps_model=="ps_logreg_custom",or_model=="or_lin_reg",method=="DR2") %>% group_by(ps_model,or_model)%>% summarise(ps_cal1 = mean(cal1),or_rsq = mean(or_rsq),rrmse = sqrt(mean(error^2))/mean(y_true)) %>% ungroup()
+  b = df_main %>% filter(ps_model=="ps_xgb_custom_1",or_model=="or_lin_reg",method=="DR2") %>% group_by(ps_model,or_model)%>% summarise(ps_cal1 = mean(cal1),or_rsq = mean(or_rsq),rrmse = sqrt(mean(error^2))/mean(y_true)) %>% ungroup()
+  c1 = df_main %>% filter(ps_model=="ps_logreg_custom",or_model=="or_xgboost",method=="DR2") %>% group_by(ps_model,or_model)%>% summarise(ps_cal1 = mean(cal1),or_rsq = mean(or_rsq),rrmse = sqrt(mean(error^2))/mean(y_true)) %>% ungroup()
+  d = df_main %>% filter(ps_model=="ps_xgb_custom_1",or_model=="or_xgboost",method=="DR2") %>% group_by(ps_model,or_model)%>% summarise(ps_cal1 = mean(cal1),or_rsq = mean(or_rsq),rrmse = sqrt(mean(error^2))/mean(y_true)) %>% ungroup()
+  
+  bind_rows(a,b,c1,d)
+}
+produce_summary_relation(df_temp %>% filter(dataset=="SyntheticLinear_LowNoise",np_sampling=="Non-Linear",nonprob_size==25000,prob_size==5000))
+```
+
+```{r}
+df_main = df_temp %>% filter(dataset=="SyntheticLinear_LowNoise",np_sampling=="Non-Linear",nonprob_size==25000,prob_size==5000)
+a = df_main %>% filter(ps_model=="ps_logreg_custom",or_model=="or_lin_reg",method=="DR2") 
+b = df_main %>% filter(ps_model=="ps_xgb_custom_1",or_model=="or_lin_reg",method=="DR2")
+c1 = df_main %>% filter(ps_model=="ps_logreg_custom",or_model=="or_xgboost",method=="DR2") 
+d = df_main %>% filter(ps_model=="ps_xgb_custom_1",or_model=="or_xgboost",method=="DR2")
+a
+```
+
+```{r}
+df_temp %>% filter(dataset=="SyntheticNonLinear",np_sampling=="Non-Linear",nonprob_size==25000,prob_size==5000,method=="DR2") %>% lm(abs(error) ~ ps_model*or_model,data = .) %>% summary()
+```
+```{r}
+df_temp %>% filter(dataset=="SyntheticNonLinear",np_sampling=="Non-Linear",nonprob_size==25000,prob_size==5000,method=="DR2") 
+```
+
+```{r}
+df_temp %>% filter(dataset=="SyntheticNonLinear",np_sampling=="Non-Linear",nonprob_size==25000,prob_size==5000,method=="DR2") %>% group_by(ps_model,or_model) %>% summarise(mean(abs(error)))
+```
+
+```{r}
+produce_summary_relation(df_temp %>% filter(dataset=="SyntheticNonLinear",np_sampling=="Non-Linear"))
+```
+
+```{r,fig.width=12}
+result3 %>% mutate(error = estimate - y_true) %>% filter(method=="DR2",ps_model=="ps_logreg_custom") %>% ggplot(aes(x=or_rsq,y=error/y_true,col=or_model)) + geom_point(size=0.4) + facet_grid(np_sampling~dataset+nonprob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + ylim(-0.25,0.25) + guides(col = guide_legend(override.aes = list(size=2)))
+```
+
+```{r,fig.width=12}
+result3 %>% mutate(error = estimate - y_true) %>% filter(method=="DR2",or_model=="or_lin_reg") %>% ggplot(aes(x=or_rsq,y=error/y_true,col=ps_model)) + geom_point(size=0.4) + facet_grid(np_sampling~dataset+prob_size) + geom_abline(intercept=0,slope=0) + theme_minimal() + ylim(-0.3,0.3) + guides(col = guide_legend(override.aes = list(size=2)))
+```
+
+
+```{r}
+datasets = c("SyntheticLinear_HighNoise", "SyntheticLinear_LowNoise" , "SyntheticNonLinear")
+samplings = c("Linear","Non-Linear")
+
+dataset = datasets[1]
+np_sampling = samplings[2]
+
+base_grids = expand.grid(cal1 = seq(0,1,0.01),or_rsq = seq(0,1,0.01))
+base_data = result3 %>% filter(subset=="NP+P-Intersection",method=="DR2",dataset==dataset,np_sampling==np_sampling)
+model =  lm(abs_pct_error ~ cal1*or_rsq,data = base_data) 
+base_grids$abs_pct_error = predict(model,base_grids) 
+
+ggplot(base_grids,aes(x=or_rsq,y=cal1,fill=abs_pct_error)) + geom_tile() + theme_minimal() + xlab(TeX("(Outcome Regression) $R^2$")) + ylab(TeX("(Propensity Score) Cal1"))+scale_fill_viridis_b(n.breaks=15) + geom_point(data = base_data,aes(x=or_rsq,y=cal1),fill="black",size=0.1)
+```
+```{r}
+library(rpart)
+library(rpart.plot)
+data_model = result3 %>% filter(subset=="NP+P-Intersection",method=="DR2")
+model_tree = rpart(abs_pct_error ~ ps_model + or_model + dataset + np_sampling + prob_size + nonprob_size,data=data_model)
+rpart.plot(model_tree)
+```
+
+```{r}
+result3 %>% filter(subset=="NP+P-Intersection",method=="IPW2") %>% group_by(dataset,np_sampling) %>% summarise(mxe = cor(mxe,abs_pct_error),cal1 = cor(cal1,abs_pct_error))
+```
+
+```{r}
+result3 %>% filter(method=="REG") %>% group_by(dataset,np_sampling) %>% summarise(or_mae = cor(or_mae,abs_pct_error),r2 = cor(or_rsq,abs_pct_error))
+```
+```{r}
+result3 %>% filter(dataset=="SyntheticLinear_LowNoise",np_sampling=="Linear",method=="DR2") 
+```
+
+```{r}
+result_linear2 = result3 %>% 
+  filter(method=="DR2",subset=="NP+P-Intersection") %>% 
+  filter(dataset=="SyntheticLinear_LowNoise",np_sampling=="Linear") %>% 
+  mutate(one_min_r2 = 1-or_rsq,error=estimate-y_true)
+
+df1 = result_linear2 %>% filter(ps_model=="ps_logreg_custom",or_model=="or_lin_reg")
+df2 = result_linear2 %>% filter(ps_model=="ps_xgb_custom_1",or_model=="or_lin_reg")
+df3 = result_linear2 %>% filter(ps_model=="ps_logreg_custom",or_model=="or_decision_tree")
+model1 = lm(error ~cal1*one_min_r2,df1)
+model2 = lm(abs_pct_error ~cal1*one_min_r2,df2) 
+model3 = lm(abs_pct_error ~cal1*one_min_r2,df3) 
+
+
+```
+Check : Correctly Specified Model vs Model Performance
+```{r}
+model_all = lm(abs_pct_error ~cal1*one_min_r2,result_linear2) 
+make_heatmap(model_all,result_linear2)
+```
+
+```{r}
+result3 %>% filter(method=="IPW2") %>% pivot_longer(c(mxe,brier,cal1),names_to = "ps_metrics" ) %>% ggplot(aes(x=value,y=abs_pct_error,col=dataset)) + geom_point() + facet_grid(dataset~ps_metrics,scales="free_x")
+```
+```{r}
+result3$method %>% table()
+```
+
+```{r}
+result3 %>% filter(method=="REG") %>% pivot_longer(c(or_rsq,or_mae),names_to = "or_metrics" ) %>% ggplot(aes(x=value,y=abs_pct_error,col=dataset)) + geom_point() + facet_grid(dataset~or_metrics,scales="free")
+```
+
+```{r}
+result3 %>% filter(method=="IPW2",cal1<1,subset=="NP+P-Intersection") %>% ggplot(aes(x=cal1,y=abs_pct_error)) + geom_point()
+```
+
+```{r}
+model_explain = lm(abs_pct_error ~ cal1*or_rsq , data = result3 %>% filter(method=="DR2",cal1<1.5,subset=="NP+P-Intersection"))
+summary(model_explain)
+```
+```{r}
+df_plot = expand.grid(or_rsq = seq(0,1,0.01),cal1 = seq(0,1.5,0.01))
+df_plot$`abs%error` = predict(model_explain,df_plot)
+ggplot(df_plot,aes(x=or_rsq,y=cal1,fill=`abs%error`)) + geom_tile() + scale_fill_viridis_b(n.breaks=10) + theme_minimal() + xlab(TeX("(Outcome Regression) $R^2$")) + ylab(TeX("(Propensity Score) Cal1"))
+```
+```{r}
+model_explain$res
+```
+
+
+
+```{r}
+lm(abs_pct_error~cal1 * or_rsq + cal1*np_sampling, result3) %>% summary()
+```
+
+```{r}
+lm(abs_pct_error ~ cal1 , data = result3 %>% filter(method=="pseudo-weighting",cal1<1.5,subset=="NP+P-Intersection"))  %>% summary()
+```
+```{r}
+lm(abs_pct_error ~ cal1 , data = result3 %>% filter(method=="IPW2",cal1<1.5,subset=="NP+P-Intersection"))  %>% summary()
+```
+```{r}
+lm(abs_pct_error ~ brier , data = result3 %>% filter(method=="pseudo-weighting",cal1<1.5,subset=="NP+P-Intersection"))  %>% summary()
+```
+```{r}
+lm(abs_pct_error ~ or_rsq , data = result3 %>% filter(method=="IPW2",cal1<1.5,subset=="NP+P-Intersection"))  %>% summary()
+```
+
+```{r}
+result_analysis_perform = results %>% filter(subset=="NP+P-Intersection")
+result_analysis_perform
+lm(pct_bias ~mxe + brier + cal1 + or_rsq + or_mae, data = result_analysis_perform) %>% summary()
+```
+```{r}
+model_explain = lm(pct_bias ~mxe + brier + cal1 + or_rsq + or_mae, data = result_analysis_perform %>% filter(method=="DR2"))
+plot(model_explain)
+```
+```{r}
+model_explain = lm(abs(pct_bias) ~ brier + or_rsq , data = result_analysis_perform %>% filter(method=="DR2"))
+summary(model_explain)
+```
+```{r}
+plot(model_explain)
+```
+```{r}
+model_explain = lm(abs(pct_bias) ~ cal1*brier*or_rsq , data = result_analysis_perform %>% filter(method=="DR2"))
+summary(model_explain)
+```
+```{r}
+plot(model_explain)
+```
+
+```{r}
+ggplot(result_analysis_perform %>% filter(method=="DR2"),aes(x=cal1,y=pct_bias) )+ geom_point(alpha = 0.1)
+```
+```{r}
+ggplot(result_analysis_perform %>% filter(method=="DR2",abs(pct_bias)<3),aes(x=or_rsq,y=cal1,col = abs(pct_bias)) )+ geom_point(alpha = 0.5) + scale_color_viridis_b(n.breaks=6)
+```
+
+```{r}
+ggplot(result_analysis_perform %>% filter(method=="DR2"),aes(x=or_rsq,y=pct_bias) )+ geom_point(alpha = 0.1)
+```
+
+```{r}
+ggplot(result_analysis_perform %>% filter(method=="DR2"),aes(x=cal1,y=or_rsq,color=pct_bias) )+ geom_point(alpha = 0.1)
+
+
+model_explain = lm(abs(pct_bias) ~ cal1*or_rsq , data = result_analysis_perform %>% filter(method=="DR2",cal1<1))
+summary(model_explain)
+
+df_plot = expand.grid(or_rsq = seq(0,2,0.01),cal1 = seq(0,2,0.01))
+df_plot$abs_error = predict(model_explain,df_plot)
+ggplot(df_plot,aes(x=or_rsq,y=cal1,fill=abs_error)) + geom_tile() + scale_fill_viridis_b()
+```
+Filter by dataset ?
+```{r}
+# ggplot(result_analysis_perform %>% filter(method=="DR2"),aes(x=cal1,y=or_rsq,color=pct_bias) )+ geom_point(alpha = 0.1)
+
+
+model_explain = lm(abs(pct_bias) ~ cal1*or_rsq , data = result_analysis_perform %>% filter(method=="DR2",dataset ="SyntheticLinear_LowNoise"))
+summary(model_explain)
+
+df_plot = expand.grid(or_rsq = seq(0,1,0.01),cal1 = seq(0,1,0.01))
+df_plot$abs_error = predict(model_explain,df_plot)
+ggplot(df_plot,aes(x=or_rsq,y=cal1,fill=abs_error)) + geom_tile() + scale_fill_viridis_b(n.breaks=6)
+```
+```{r}
+results$dataset %>% summary()
+```
+
+
+
+```{r}
+```
+
+Question : (PS model) does XGBoost increase the accuracy model compared to Logistic Regression ?
+Measure : Difference of rel_rmse as predictor
+
+```{r}
+temp = df_dr_result %>% 
+  filter(ps_model %in% c("ps_logreg_custom","ps_xgb_custom_1")) %>% 
+  pivot_wider(names_from = ps_model, values_from = rel_rmse) %>% 
+  mutate(performance_difference = ps_xgb_custom_1 - ps_logreg_custom)
+```
+
+
+```{r}
+model = lmer(abs(pct_bias)  ~dataset + np_sampling + nonprob_size + prob_size + ( 1 + ps_model + or_model | replication),data= temp)
+anova(model)
+```
+
+
+```{r}
+library(lme4)
+df_dr_result = result_nosubset %>% filter(
+  dataset %in% c(
+    "SyntheticLinear_HighNoise",
+    "SyntheticLinear_LowNoise",
+    "SyntheticNonLinear"
+  ),
+  method == "DR2"
+)
+model = lmer(abs(pct_bias)  ~dataset + np_sampling + nonprob_size + prob_size + ( 1 + ps_model + or_model | replication),data= df_dr_result)
+anova(model)
+```
+```{r}
+model
+```
+
+```{r}
+model = lmer(abs(pct_bias)  ~dataset + np_sampling + nonprob_size + prob_size + ( 1 + ps_model + or_model | replication),data= df_dr_result)
+anova(model)
+```
+
+```{r}
+plot(model)
+```
+
+# OKR Data Result
+
+## IPW
+```{r}
+result_nosubset %>% filter(
+  dataset %in% c(
+    "okr"
+  ),
+  method == "IPW2",
+  nonprob_size != 100000
+)  %>% pivot_wider(
+  names_from = ps_model,
+  values_from = error,
+  id_cols = c(
+    dataset,
+    np_sampling,
+    replication,
+    nonprob_size,
+    prob_size,
+    y_true
+  )
+) %>% group_by(dataset, np_sampling, nonprob_size, prob_size) %>% summarise(
+  LogReg = sqrt(mean(ps_logreg_custom^2)) / mean(y_true),
+  XGBoost1 = sqrt(mean(ps_xgb_custom_1^2)) /
+    mean(y_true),
+  XGBoost2 = sqrt(mean(ps_xgb_custom_2^2)) /
+    mean(y_true)
+)  %>%
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>%
+  mutate(pair_size = factor(
+    pair_size,
+    c(
+      "(1000,500)",
+      "(1000,1500)",
+      "(1000,5000)",
+      "(5000,500)",
+      "(5000,1500)",
+      "(5000,5000)",
+      "(25000,500)",
+      "(25000,1500)",
+      "(25000,5000)",
+      "(100000,100000)"
+    )
+  )) %>%
+  pivot_longer(c(LogReg, XGBoost1, XGBoost2),
+               names_to = "PS_model",
+               values_to = "rel_rmse") %>% arrange(prob_size, nonprob_size) %>% 
+  ggplot(aes(x = pair_size, y = rel_rmse, fill = PS_model)) + 
+  geom_col(position = "dodge") + 
+  facet_grid(np_sampling ~ dataset, labeller = label_wrap_gen(width = 10)) + 
+  guides(x = guide_axis(angle = 45)) + 
+  xlab(TeX("Pair sample size $(n_{NP},n_{P})$")) + 
+  ylab("Relative RMSE") + theme_minimal()
+```
+
+## REG
+```{r}
+result_nosubset %>% filter(
+  dataset %in% c(
+    "okr"
+  ),
+  method == "REG",
+  nonprob_size != 100000
+)  %>% pivot_wider(
+  names_from = ps_model,
+  values_from = error,
+  id_cols = c(
+    dataset,
+    np_sampling,
+    replication,
+    nonprob_size,
+    prob_size,
+    y_true
+  )
+) %>% group_by(dataset, np_sampling, nonprob_size, prob_size) %>% summarise(
+  LogReg = sqrt(mean(ps_logreg_custom^2)) / mean(y_true),
+  XGBoost1 = sqrt(mean(ps_xgb_custom_1^2)) /
+    mean(y_true),
+  XGBoost2 = sqrt(mean(ps_xgb_custom_2^2)) /
+    mean(y_true)
+)  %>%
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>%
+  mutate(pair_size = factor(
+    pair_size,
+    c(
+      "(1000,500)",
+      "(1000,1500)",
+      "(1000,5000)",
+      "(5000,500)",
+      "(5000,1500)",
+      "(5000,5000)",
+      "(25000,500)",
+      "(25000,1500)",
+      "(25000,5000)",
+      "(100000,100000)"
+    )
+  )) %>%
+  pivot_longer(c(LogReg, XGBoost1, XGBoost2),
+               names_to = "PS_model",
+               values_to = "rel_rmse") %>% arrange(prob_size, nonprob_size) %>% 
+  ggplot(aes(x = pair_size, y = rel_rmse, fill = PS_model)) + 
+  geom_col(position = "dodge") + 
+  facet_grid(np_sampling ~ dataset, labeller = label_wrap_gen(width = 10)) + 
+  guides(x = guide_axis(angle = 45)) + 
+  xlab(TeX("Pair sample size $(n_{NP},n_{P})$")) + 
+  ylab("Relative RMSE") + theme_minimal()
+```
+
+```{r}
+df_reg_result = result_nosubset %>% filter(
+  dataset %in% c(
+    "okr"
+  ),
+  method == "REG"
+) %>% pivot_wider(
+  names_from = or_model,
+  values_from = error,
+  id_cols = c(dataset, replication, nonprob_size, prob_size,y_true)
+) %>% group_by(dataset, nonprob_size, prob_size) %>% summarise(DecisionTree = sqrt(mean(or_decision_tree ^2))/mean(y_true),
+                                                               LinearRegression = sqrt(mean(or_lin_reg ^ 2))/mean(y_true),
+                                                               RandomForest = sqrt(mean(or_random_forest ^ 2))/mean(y_true),
+                                                               XGBoost = sqrt(mean(or_xgboost ^ 2))/mean(y_true)) 
+
+df_reg_result
+
+```
+
+## DR
+```{r}
+df_dr_result = result_nosubset %>% filter(
+  dataset %in% c(
+    "okr"
+  ),
+  method == "DR2"
+) %>% group_by(dataset,np_sampling,nonprob_size,prob_size,ps_model,or_model) %>% summarise(rel_rmse = sqrt(mean(error^2))/mean(y_true))%>% ungroup()   %>%
+  mutate(pair_size = paste0("(", as.integer(nonprob_size), ",", as.integer(prob_size), ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)","(100000,100000)"))) %>% pivot_wider(names_from = or_model, values_from = rel_rmse)
+df_dr_result %>% filter(nonprob_size == 1000) %>% arrange(ps_model,prob_size)
+```
+
+```{r}
+df_dr_result = result_nosubset %>% filter(
+  dataset %in% c(
+    "okr"
+  ),
+  method == "DR2"
+) %>% group_by(dataset,np_sampling,nonprob_size,prob_size,ps_model,or_model) %>% summarise(rel_rmse = sqrt(mean(error^2))/mean(y_true))%>% ungroup()   %>%
+  mutate(pair_size = paste0("(", as.integer(nonprob_size), ",", as.integer(prob_size), ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)","(100000,100000)"))) %>% pivot_wider(names_from = or_model, values_from = rel_rmse)
+df_dr_result %>% filter(nonprob_size == 25000) %>% arrange(ps_model,prob_size)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+ result_nosubset %>% filter(
+  dataset %in% c(
+    "okr"
+  ),
+  method == "IPW2",
+  nonprob_size != 100000
+) %>% pivot_wider(
+  names_from = ps_model,
+  values_from = error,
+  id_cols = c(dataset,np_sampling, replication, nonprob_size, prob_size,y_true)
+) %>% group_by(dataset,np_sampling, nonprob_size, prob_size) %>% summarise(LogReg = sqrt(mean(ps_logreg_custom ^2))/mean(y_true),
+                                                               XGBoost1 = sqrt(mean(ps_xgb_custom_1 ^ 2))/mean(y_true),
+                                                               XGBoost2 = sqrt(mean(ps_xgb_custom_2 ^ 2))/mean(y_true))  %>%
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)","(100000,100000)"))) %>% 
+  pivot_longer(c(LogReg, XGBoost1,XGBoost2), names_to = "PS_model", values_to = "rel_rmse") %>% arrange(prob_size, nonprob_size) %>% ggplot(aes(x = pair_size, y = rel_rmse, fill = PS_model)) + geom_col(position = "dodge") + facet_grid( ~np_sampling+dataset,labeller = label_wrap_gen(width=10))  + guides(x = guide_axis(angle = 45)) + xlab(TeX("Pair sample size $(n_{NP},n_{P})$")) + ylab("Relative RMSE") + theme_bw()
+```
+
+# Combination of PW and Chen DR
+
+```{r}
+list_result = list.files(path="../result_5June",pattern="_combined.csv",full.names = T)
+results = lapply(list_result,read.csv) %>% bind_rows() %>% mutate("pct_bias" = 100*(estimate - y_true)/y_true)
+
+list_files_big = list.files(path="../result_9June_big",pattern="_combined.csv",full.names = T)
+results2 = lapply(list_files_big,read.csv)  %>% bind_rows() %>% mutate("pct_bias" = 100*(estimate - y_true)/y_true)
+
+list_files_pwdr = list.files(path="../result_20June_combination",pattern="_combined.csv",full.names = T)
+results3 = lapply(list_files_pwdr,read.csv)  %>% bind_rows() %>% mutate("pct_bias" = 100*(estimate - y_true)/y_true)
+results3$replication = results3$replication + 1000 
+
+results = bind_rows(results,results3)
+
+list_datasets = c("synthethic_linear_high_noise","synthethic_linear_low_noise","synthethic_non_linear")
+list_np_sampling = c("simple","complex")
+results2$prob_size = 100000
+results2$nonprob_size = 100000
+results2$dataset = str_extract(results2$config,paste(list_datasets,collapse="|"))
+results2$method_variant = str_extract(results2$config,paste(list_np_sampling,collapse="|"))
+results2$config_name = results2$config
+results2$description = ""
+results2$sampling_technique = "synthetic"
+
+results = results %>% left_join(SIMULATION_CONFIGS,by = "config")
+
+results = bind_rows(results,results2)
+results = results %>% 
+  mutate(error = estimate-y_true)
+results$np_sampling = results$method_variant
+results$np_sampling = ifelse(results$np_sampling=="complex","Non-Linear","Linear")
+results$dataset = as.factor(results$dataset)
+results$dataset = relevel(results$dataset,"synthethic_linear_low_noise","synthethic_linear_high_noise","synthethic_non_linear","okr")
+
+results$dataset = recode(results$dataset,synthethic_linear_high_noise = "SyntheticLinear_HighNoise",synthethic_linear_low_noise = "SyntheticLinear_LowNoise",synthethic_non_linear = "SyntheticNonLinear")
+
+result_nosubset = results %>% filter((subset!="NP+P-Intersection") %>% replace_na(T))
+```
+
+```{r}
+result_levdr = result_nosubset %>% filter(method %in% c("DR2","IPW2","pseudo-weighting"))
+result_levdr = result_levdr %>% filter(!str_detect(ps_model,"^cal_"))
+result_levdr
+```
+
+```{r}
+result_levdr %>% group_by(dataset,np_sampling,nonprob_size,prob_size,ps_model,or_model) %>% summarise(mean_pct_bias = mean(pct_bias),rmse = sqrt(mean(error^2))) %>% ungroup() %>% arrange(dataset,np_sampling,nonprob_size,prob_size,rmse)
+```
+Chen Logistic Regression vs LEV Logistic Regression
+
+```{r,fig.width=12}
+result_levdr %>% filter(str_detect(ps_model,"log"),np_sampling=="Linear") %>% group_by(dataset,nonprob_size,prob_size,ps_model,or_model,method) %>% summarise(rmse = sqrt(mean(error^2))/mean(y_true)) %>% ungroup() %>% filter(method!="pseudo-weighting")%>% select(-method)  %>% 
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)","(100000,100000)"))) %>% arrange(prob_size, nonprob_size) %>% ggplot(aes(x=pair_size,col=ps_model,y=rmse)) + geom_col(position="dodge") + facet_grid(or_model~dataset)  
+```
+
+
+Chen XGBoost vs LEV XGBoost
+
+```{r,fig.width=14}
+result_levdr %>% filter(str_detect(ps_model,"xg"),np_sampling!="Linear") %>% group_by(dataset,nonprob_size,prob_size,ps_model,or_model,method) %>% summarise(rmse = sqrt(mean(error^2))/mean(y_true)) %>% ungroup() %>% filter(method!="pseudo-weighting")%>% select(-method)  %>% 
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)","(100000,100000)"))) %>% arrange(prob_size, nonprob_size) %>% filter(prob_size!=100000) %>% ggplot(aes(x=pair_size,fill=ps_model,y=rmse)) + geom_col(position="dodge") + facet_grid(dataset~or_model)   + guides(x = guide_axis(angle = 45)) + xlab(TeX("Pair sample size $(n_{NP},n_{P})$")) + ylab("Relative RMSE") + theme_minimal()
+```
+```{r,fig.width=12}
+result_levdr %>% filter(!str_detect(ps_model,"qda"),np_sampling=="Non-Linear") %>% group_by(dataset,nonprob_size,prob_size,ps_model,or_model,method) %>% summarise(rmse = sqrt(mean(error^2))/mean(y_true)) %>% ungroup() %>% filter(method!="pseudo-weighting")%>% select(-method)  %>% 
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)","(100000,100000)"))) %>% arrange(prob_size, nonprob_size) %>% filter(prob_size!=100000) %>% ggplot(aes(x=pair_size,fill=ps_model,y=rmse)) + geom_col(position="dodge") + facet_grid(dataset~or_model)   + guides(x = guide_axis(angle = 45)) + xlab(TeX("Pair sample size $(n_{NP},n_{P})$")) + ylab("Relative RMSE") + theme_minimal()
+```
+```{r,fig.width=12}
+result_levdr %>% filter(!str_detect(ps_model,"qda"),np_sampling=="Linear") %>% group_by(dataset,nonprob_size,prob_size,ps_model,or_model,method) %>% summarise(rmse = sqrt(mean(error^2))/mean(y_true)) %>% ungroup() %>% filter(method!="pseudo-weighting")%>% select(-method)  %>% 
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)","(100000,100000)"))) %>% arrange(prob_size, nonprob_size) %>% filter(prob_size!=100000) %>% ggplot(aes(x=pair_size,fill=ps_model,y=rmse)) + geom_col(position="dodge") + facet_grid(dataset~or_model)   + guides(x = guide_axis(angle = 45)) + xlab(TeX("Pair sample size $(n_{NP},n_{P})$")) + ylab("Relative RMSE") + theme_minimal()
+```
+
+# Which method performs the best in each scenarios ?
+
+```{r}
+options(scipen=999)
+result_nosubset %>%filter(dataset!="okr") %>% 
+  group_by(config,nonprob_size,prob_size,method,ps_model,or_model,dataset,np_sampling) %>% 
+  summarise(mbe = mean(error),rmse = sqrt(mean(error^2)),mc_var = var(estimate)) %>% group_by(config) %>% slice_min(rmse,n=2) %>% arrange(dataset,desc(np_sampling),nonprob_size,prob_size) %>% ungroup() %>% select(dataset,np_sampling,nonprob_size,prob_size,method,ps_model,or_model,rmse,mbe,mc_var)
+```
+
+
+# Deeper analysis
+
+
+# Performance again correct model
+
+## IPW Estimate
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+ipw_produce_aggregated_summarise(result_nosubset %>% filter(dataset=="synthethic_non_linear",np_sampling=="Non-Linear",method=="IPW2"))
+```
+
+# Regression Estimate
+```{r}
+result_nosubset %>% filter(dataset=="synthethic_non_linear",np_sampling=="Non-Linear",method=="REG") %>% pivot_wider(names_from = or_model,values_from = error,id_cols = c(replication,nonprob_size,prob_size)) %>% group_by(nonprob_size,prob_size) %>% summarise(mse_dec_tree = mean(or_decision_tree^2),mse_xgb = mean(or_xgboost^2),mse_lin_reg = mean(or_lin_reg^2),mse_random_forest = mean(or_random_forest^2))
+```
+```{r}
+results %>% filter(dataset=="synthethic_linear_high_noise",np_sampling==" Non-Linear",method=="REG") %>% pivot_wider(names_from = or_model,values_from = error,id_cols = c(replication,nonprob_size,prob_size)) %>% group_by(nonprob_size,prob_size)%>% summarise(mse_dec_tree = mean(or_decision_tree^2),mse_xgb = mean(or_xgboost^2),mse_lin_reg = mean(or_lin_reg^2),mse_random_forest = mean(or_random_forest^2))
+```
+```{r}
+results %>% filter(dataset=="synthethic_linear_low_noise",np_sampling=="Non-Linear",method=="REG") %>% pivot_wider(names_from = or_model,values_from = error,id_cols = c(replication,nonprob_size,prob_size)) %>% group_by(nonprob_size,prob_size) %>% summarise(mse_dec_tree = mean(or_decision_tree^2),mse_xgb = mean(or_xgboost^2),mse_lin_reg = mean(or_lin_reg^2),mse_random_forest = mean(or_random_forest^2))
+
+```
+
+```{r,fig.width= 8}
+
+```
+
+```{r}
+result_nosubset %>% filter(
+  dataset %in% c(
+    "synthethic_linear_high_noise",
+    "synthethic_linear_low_noise",
+    "synthethic_non_linear"
+  ),
+  np_sampling == "simple",
+  method == "REG"
+) %>% pivot_wider(
+  names_from = or_model,
+  values_from = error,
+  id_cols = c(dataset, replication, nonprob_size, prob_size,y_true)
+) %>% group_by(dataset, nonprob_size, prob_size) %>% summarise(DecisionTree = sqrt(mean(or_decision_tree ^2))/mean(y_true),
+                                                               LinearRegression = sqrt(mean(or_lin_reg ^ 2))/mean(y_true),
+                                                               RandomForest = sqrt(mean(or_random_forest ^ 2))/mean(y_true),
+                                                               XGBoost = sqrt(mean(or_xgboost ^ 2))/mean(y_true))  %>%
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)"))) %>% ungroup() %>% select(dataset,nonprob_size,prob_size,DecisionTree,LinearRegression,RandomForest,XGBoost) %>% print(digits = 3) %>% tibble() #%>% pivot_longer(c(DecisionTree, LinearRegression,RandomForest,XGBoost), names_to = "model", values_to = "rel_rmse") %>% arrange(prob_size, nonprob_size) 
+```
+
+## Doubly Robust
+
+```{r,fig.width= 12}
+
+```
+
+```{r}
+result_nosubset %>% filter(
+  dataset %in% c(
+    "synthethic_linear_high_noise",
+    "synthethic_linear_low_noise",
+    "synthethic_non_linear"
+  ),
+  method == "DR2"
+) %>% filter(prob_size==100000,nonprob_size == 100000)%>% group_by(dataset,np_sampling,ps_model,or_model) %>% summarise(mse = 100000*mean(error^2)) %>% pivot_wider(id_cols = c(dataset,np_sampling,ps_model),values_from=mse,names_from = or_model) %>% View()
+```
+
+```{r}
+df_plot = result_nosubset %>% filter(
+  dataset %in% c(
+    "synthethic_linear_high_noise",
+    "synthethic_linear_low_noise",
+    "synthethic_non_linear"
+  ),
+  method == "DR2"
+) %>% group_by(dataset,np_sampling,nonprob_size,prob_size,ps_model,or_model) %>% summarise(rel_rmse = sqrt(mean(error^2))/mean(y_true))  %>%
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)"))) %>% ungroup() %>% select(-nonprob_size,-prob_size)
+```
+
+
+# Pseudo - Weighting
+
+```{r}
+results  %>% filter(config_name=="synthethic_linear_high_noise_npsampling_Non-Linearp500np1000")%>% filter(method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% ggplot(aes(x=error,y=replication,col=calibration)) + geom_point() + facet_wrap(np_sampling~model,ncol=5) + geom_vline(xintercept = 0)
+```
+```{r}
+results  %>% filter(config_name=="synthethic_linear_high_noise_npsampling_ Non-Linearp5000np25000")%>% filter(method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% ggplot(aes(x=error,y=replication,col=calibration)) + geom_point() + facet_wrap(np_sampling~model,ncol=5) + geom_vline(xintercept = 0)
+```
+
+```{r}
+results%>% filter(method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% group_by(calibration,model) %>% summarise(rmse = mean(error^2,na.rm = T)) %>% pivot_wider(names_from = calibration,values_from = c(rmse)) %>% print(digits=2)
+```
+```{r}
+results%>% filter(method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% group_by(dataset,calibration,model) %>% summarise(rmse = mean(error^2,na.rm = T)) %>% pivot_wider(names_from = calibration,values_from = c(rmse)) %>% print(digits=2)
+```
+
+```{r}
+result_nosubset%>% filter(method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% group_by(dataset,np_sampling,nonprob_size,prob_size,calibration,model) %>% summarise(rmse = mean(error^2,na.rm = T)) %>% pivot_wider(names_from = calibration,values_from = c(rmse)) %>% print(digits=2) %>%  arrange(cal_platt/uncal)
+```
+
+```{r}
+result_nosubset %>% filter(ps_model=="uncal_logreg",config=="synthethic_linear_low_noise_npsampling_ Non-Linearp500np5000") %>% ggplot(aes(x=estimate)) + geom_histogram()
+```
+```{r}
+results %>% filter(!method %in% c("IPW1","DR1","naive"),np_sampling!="simple") %>% mutate(model_id = str_c(method,ps_model,or_model)) %>% group_by(model_id,config_name) %>% summarise(mpe = mean(pct_bias)) %>% ggplot(aes(x=model_id,y=config_name,fill=mpe)) + geom_tile() + guides(x=guide_axis(angle = 90)) +scale_fill_gradient(low="blue",high="red")
+```
+# Reserach Question
+
+## 1. Apply XGBoost for Liu's Method
+## To test if this is any good, here are simulation result 
+
+IPW Estimator
+```{r}
+result_nosubset %>% filter(
+  dataset %in% c(
+    "synthethic_linear_high_noise",
+    "synthethic_linear_low_noise",
+    "synthethic_non_linear"
+  ),
+  np_sampling == "Non-Linear",
+  method == "IPW2"
+) %>% pivot_wider(
+  names_from = ps_model,
+  values_from = error,
+  id_cols = c(dataset, replication, nonprob_size, prob_size,y_true)
+) %>% group_by(dataset, nonprob_size, prob_size) %>% summarise(logreg = sqrt(mean(ps_logreg_custom ^2))/mean(y_true),
+                                                               xgb1 = sqrt(mean(ps_xgb_custom_1 ^ 2))/mean(y_true),
+                                                               xgb2 = sqrt(mean(ps_xgb_custom_2 ^ 2))/mean(y_true))  %>%
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)"))) %>% 
+  pivot_longer(c(logreg, xgb1,xgb2), names_to = "model", values_to = "rel_rmse") %>% arrange(prob_size, nonprob_size) %>% ggplot(aes(x =
+                                                                                                                                                                                                                                                                                                                                                                                   pair_size, y = rel_rmse, fill = model)) + geom_col(position = "dodge") + facet_wrap( ~dataset,scales = "free_y")  + guides(x = guide_axis(angle = 45))
+```
+```{r}
+result_nosubset %>% filter(
+  dataset %in% c(
+    "synthethic_linear_high_noise",
+    "synthethic_linear_low_noise",
+    "synthethic_non_linear"
+  ),
+  np_sampling == "simple",
+  method == "IPW2"
+) %>% pivot_wider(
+  names_from = ps_model,
+  values_from = error,
+  id_cols = c(dataset, replication, nonprob_size, prob_size,y_true)
+) %>% group_by(dataset, nonprob_size, prob_size) %>% summarise(logreg = sqrt(mean(ps_logreg_custom ^2))/mean(y_true),
+                                                               xgb1 = sqrt(mean(ps_xgb_custom_1 ^ 2))/mean(y_true),
+                                                               xgb2 = sqrt(mean(ps_xgb_custom_2 ^ 2))/mean(y_true))  %>%
+  mutate(pair_size = paste0("(", nonprob_size, ",", prob_size, ")")) %>% 
+  mutate(pair_size = factor(pair_size, c("(1000,500)", "(1000,1500)", "(1000,5000)","(5000,500)", "(5000,1500)", "(5000,5000)","(25000,500)", "(25000,1500)", "(25000,5000)"))) %>% 
+  pivot_longer(c(logreg, xgb1,xgb2), names_to = "model", values_to = "rel_rmse") %>% arrange(prob_size, nonprob_size) %>% ggplot(aes(x =
+                                                                                                                                                                                                                                                                                                                                                                                   pair_size, y = rel_rmse, fill = model)) + geom_col(position = "dodge") + facet_wrap( ~dataset)  + guides(x = guide_axis(angle = 45))
+```
+
+```{r}
+result_nosubset %>% filter(dataset %in% c("synthethic_linear_high_noise","synthethic_linear_low_noise","synthethic_non_linear"),np_sampling=="simple",method=="IPW2") %>% pivot_wider(names_from = ps_model,values_from = error,id_cols = c(dataset,replication,nonprob_size,prob_size)) %>% group_by(dataset,nonprob_size,prob_size) %>% summarise(logreg = mean(ps_logreg_custom^2),xgb = mean(ps_xgb_custom_1^2))  %>% mutate(pair_size = paste0("(",nonprob_size,",",prob_size,")")) %>% pivot_longer(c(logreg,xgb),names_to = "model",values_to = "rmse") %>% arrange(prob_size,nonprob_size) %>% ggplot(aes(x=pair_size,y=rmse,fill=model)) + geom_col(position="dodge") + facet_wrap(~dataset)  + guides(x=guide_axis(angle = 45))
+```
+
+# Pseudo-Weighting
+
+```{r}
+result_nosubset %>% filter(dataset!="okr",method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% group_by(dataset,np_sampling,nonprob_size,prob_size,calibration,model) %>% summarise(mse = mean(error^2)) %>% pivot_wider(names_from = calibration,values_from = c(mse)) %>% mutate(platt_improve = cal_platt < uncal, isotonic_improve = cal_iso < uncal) #%>% ungroup()%>% summarise(mean(platt_improve),mean(isotonic_improve))
+```
+```{r}
+data_modelling = result_nosubset %>% filter(dataset!="okr",method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% group_by(dataset,np_sampling,nonprob_size,prob_size,calibration,model) %>% summarise(mse = mean(error^2)) %>% pivot_wider(names_from = calibration,values_from = c(mse)) %>% mutate(platt_improve = cal_platt < uncal, isotonic_improve = cal_iso < uncal)
+idx_max_col = - data_modelling[c("cal_iso","cal_platt","uncal")] %>% max.col()
+data_modelling$best_approach = c("cal_iso","cal_platt","uncal")[idx_max_col]
+
+data_modelling$best_approach = as.factor(data_modelling$best_approach)
+data_modelling$best_approach = recode(data_modelling$best_approach,cal_iso = "IS", uncal = "UN" ,cal_platt =  "PL")
+
+data_modelling$dataset = as.factor(data_modelling$dataset)
+data_modelling$np_sampling = as.factor(data_modelling$np_sampling)
+data_modelling$model = as.factor(data_modelling$model)
+```
+
+
+```{r,fig.width=13}
+library(partykit)
+model_tree = ctree(best_approach ~ dataset + np_sampling + nonprob_size + prob_size + model , data = data_modelling)
+plot(model_tree)
+```
+```{r}
+
+```
+
+
+```{r}
+result_nosubset %>% filter(dataset!="okr",method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% group_by(dataset,np_sampling,nonprob_size,prob_size,calibration,model) %>% summarise(mse = mean(error^2)) %>% pivot_wider(names_from = calibration,values_from = c(mse)) %>% mutate(platt_improve = cal_platt < uncal, isotonic_improve = cal_iso < uncal) %>% ungroup()%>% summarise(mean(platt_improve),mean(isotonic_improve))
+```
+
+```{r}
+results  %>% filter(dataset == "synthethic_linear_high_noise",np_sampling== "Linear",nonprob_size == 25000,prob_size == 5000) %>% filter(method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% ggplot(aes(x=error,y=replication,col=calibration)) + geom_point() + facet_wrap(np_sampling~model,ncol=5,scales="free_x") + geom_vline(xintercept = 0)
+```
+
+```{r}
+results  %>% filter(dataset == "synthethic_linear_high_noise",np_sampling== "Linear",nonprob_size == 25000,prob_size == 5000) %>% filter(method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% filter(model %in% c("logreg","qda_model"))%>% ggplot(aes(x=error,col=calibration)) + geom_density() + facet_wrap(np_sampling~model,ncol=5) + geom_vline(xintercept = 0) +xlab("Error of the final estimation")
+
+#%>% ggplot(aes(x=error,y=replication,col=calibration)) + geom_point() + facet_wrap(np_sampling~model,ncol=5) + geom_vline(xintercept = 0)
+```
+
+```{r}
+results  %>% filter(dataset == "synthethic_non_linear",np_sampling== "Non-Linear",nonprob_size == 25000,prob_size == 5000) %>% filter(method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% ggplot(aes(x=error,col=calibration)) + geom_density() + facet_wrap(np_sampling~model,ncol=5) + geom_vline(xintercept = 0)
+```
+```{r}
+results  %>% filter(dataset == "synthethic_non_linear",np_sampling== "Non-Linear",nonprob_size == 5000,prob_size == 1500) %>% filter(method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% ggplot(aes(x=error,col=calibration)) + geom_density() + facet_wrap(np_sampling~model,ncol=5) + geom_vline(xintercept = 0)
+```
+```{r}
+results  %>% filter(dataset == "synthethic_non_linear",np_sampling== "Linear",nonprob_size == 5000,prob_size == 1500) %>% filter(method=="pseudo-weighting")%>% 
+  extract(
+    col    = ps_model,
+    into   = c("calibration", "model"),
+    regex  = "^(uncal|cal_platt|cal_iso)_(.+)$"
+  ) %>% ggplot(aes(x=error,col=calibration)) + geom_density() + facet_wrap(np_sampling~model,ncol=5) + geom_vline(xintercept = 0)
+```
+```{r}
+# PW
+data_pw_model = results %>% filter(nonprob_size == 25000,prob_size == 5000) %>% filter(method=="pseudo-weighting",dataset!="okr") 
+
+lm(pct_bias~mxe + dataset + np_sampling,data_pw_model) %>% summary()
+```
+```{r}
+lm(pct_bias~cal1*dataset*np_sampling,data_pw_model) %>% summary()
+```
+

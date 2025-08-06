@@ -277,21 +277,17 @@ run_simulation_replication <- function(config) {
   cv_ps_xgb_1 <- cross_validate_ps_model(nonprob_sample, prob_sample, predictors, calculate_ps_xgb_1)
   cv_ps_xgb_2 <- cross_validate_ps_model(nonprob_sample, prob_sample, predictors, calculate_ps_xgb_2)
   
-  print(cv_ps_logreg)
-  print(cv_ps_xgb_1)
-
   # Calculate pseudo-weight estimates (calibrated + uncalibrated)
-  # ps_calibrated_pw <- create_calibrated_pseudo_weight(
-  #   nonprob_sample, prob_sample, predictors, pred_set = "np"
-  # )
+  ps_calibrated_pw <- create_calibrated_pseudo_weight(
+    nonprob_sample, prob_sample, predictors, pred_set = "np"
+  )
   
   # Get pseudo-weight results
-  # pw_result <- pseudo_weight_estimates(nonprob_sample, ps_calibrated_pw, outcome)
-  # nonprob_sample = cbind(nonprob_sample,ps_calibrated_pw)
+  pw_result <- pseudo_weight_estimates(nonprob_sample, ps_calibrated_pw, outcome)
+  nonprob_sample = cbind(nonprob_sample,ps_calibrated_pw)
   
   # Cross validation for pseudo-weight methods
-  # cv_ps_cal_pw <- cross_validate_ps_model(nonprob_sample, prob_sample, predictors, create_calibrated_pseudo_weight)
-  
+  cv_ps_cal_pw <- cross_validate_ps_model(nonprob_sample, prob_sample, predictors, create_calibrated_pseudo_weight)
   
   # Create all combinations of OR and PS models
   list_or_model <- names(or_predictions$nonprob_pred)
@@ -321,8 +317,7 @@ run_simulation_replication <- function(config) {
   all_result$y_true <- mean(samples$population[[outcome]])
   
   # Combine with metrics
-  # ps_metrics <- rbind(cv_ps_logreg, cv_ps_xgb_1,cv_ps_xgb_2,cv_ps_cal_pw) # IPW + PW. DR not included
-  ps_metrics <- rbind(cv_ps_logreg, cv_ps_xgb_1,cv_ps_xgb_2)
+  ps_metrics <- rbind(cv_ps_logreg, cv_ps_xgb_1,cv_ps_xgb_2,cv_ps_cal_pw)
   
   print(ps_metrics)
   all_result <- all_result %>%
@@ -483,4 +478,5 @@ cat("=======================================================\n\n")
 
 # Stop the cluster
 stopCluster(cl)
+
 

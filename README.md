@@ -6,19 +6,15 @@ Supervisors :
 - Dr. Sander Scholtus (CBS)
 - Prof. Elise Dusseldorp (Leiden University)
 
-This the code repository of the upcoming thesis master "Correcting Selection Bias with Machine Learning".
+This the code repository of the upcoming thesis master "Selection Bias Correction in a Two-Sample Setup Using Machine Learning".
 
 The repository contains implementation statistical estimation using probabilistic and non-probability sampling methods, supporting various estimators including :
--  Double Robust (DR) estimators for nonprobability sample
--  Pseudo-weight estimators 
+-  Double Robust (DR) estimators for nonprobability sample introduced by (Chen, 2022)[https://www.tandfonline.com/doi/abs/10.1080/01621459.2019.1677241]
+-  Pseudo-weight estimators introduced by (Liu, 2023)[https://research.tilburguniversity.edu/en/publications/correcting-selection-bias-in-big-data-by-pseudo-weighting] 
 
 Some novelty introduced with this work : 
 - Applying Machine Learning algorithms with custom objective function to support Doubly Robust estimator 
-- Machine Learning calibration to support the Pseudo-Weight estimator
-
-TODO : 
-- Implementation of synthetic dataset sampling with different sampling mechanism
-- Code to run analysis on the result using Structural Equation Modeling
+- Applying Machine Learning algorithms on the Pseudo-Weight estimator
 
 ## Overview
 
@@ -60,11 +56,11 @@ Features of this code base :
   
 ## File Structure
 Inside the `code` folder, you can find : 
-- `main-script.R`: Configuration and entry point to run simulations
+- `main-script.r`: Configuration and entry point to run simulations
 - `statistical_estimation.R`: Core estimation functions and simulation logic
 - `sampling_functions.R`: Dataset-specific sampling methods
 - `sample-data-generator.R`: Script to generate synthetic test datasets if needed. Only need to be run once. It will produce `.Rdata` object.
-- `results-analysis.R`: Analysis and visualization of simulation results.
+- `results-analysis_4thJune2025.Rmd`: Analysis and visualization of simulation results.
 - `renv.lock`: Package versions for reproducibility
 
 ![flow chart](flow_chart_thesis.png)
@@ -173,10 +169,10 @@ SIMULATION_CONFIGS <- list(
 ## Troubleshooting
 
 ### Error Logs
-
 Detailed error logs are saved to:
 ```
 results/logs/[config_name]/rep[XXX]_log.txt
 ```
+
 
 <img src="https://www.rug.nl/digital-competence-centre/news/images/cbs-0.jpg" width="425"/> <img src="https://huisstijl.leidenuniv.nl/assets/files/ul-algemeen-internationaal-rgb-color.png" width="425"/> 
